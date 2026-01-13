@@ -73,10 +73,17 @@ class CentralNICAPI:
             data = response.json()
             
             # Extract domain names from response
+            # API response structure: {"ok": true, "data": [{"domain": "...", ...}, ...]}
             domains = []
-            if isinstance(data, dict) and 'domains' in data:
-                domains = [item['domain'] for item in data['domains'] if 'domain' in item]
+            if isinstance(data, dict):
+                if 'data' in data and isinstance(data['data'], list):
+                    # New API format with 'data' field
+                    domains = [item['domain'] for item in data['data'] if 'domain' in item]
+                elif 'domains' in data:
+                    # Legacy format with 'domains' field
+                    domains = [item['domain'] for item in data['domains'] if 'domain' in item]
             elif isinstance(data, list):
+                # Direct list format
                 domains = [item['domain'] for item in data if 'domain' in item]
             
             logger.info(f"Successfully fetched {len(domains)} domains for .{tld}")
