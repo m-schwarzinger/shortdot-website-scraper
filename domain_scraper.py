@@ -65,7 +65,7 @@ class CentralNICAPI:
             response = requests.get(
                 url,
                 headers=self.headers,
-                timeout=30
+                timeout=120
             )
             response.raise_for_status()
             
