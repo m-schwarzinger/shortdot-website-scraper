@@ -13,6 +13,12 @@ from typing import Dict, List, Tuple
 import logging
 import json
 from datetime import datetime
+import os
+from dotenv import load_dotenv
+import base64
+
+# Load environment variables
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(
@@ -20,6 +26,87 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+class CentralNICAPI:
+    """Handler for CentralNIC Registry API"""
+    
+    def __init__(self):
+        """Initialize API client with credentials from .env file"""
+        self.username = os.getenv('API_USERNAME')
+        self.password = os.getenv('API_PASSWORD')
+        self.base_url = os.getenv('API_BASE_URL', 'https://registry-api.centralnic.com/v2')
+        self.tlds = os.getenv('API_TLDS', 'sbs,icu,cyou,cfd,bond').split(',')
+        
+        if not self.username or not self.password:
+            raise ValueError("API_USERNAME and API_PASSWORD must be set in .env file")
+        
+        # Create Basic Auth header
+        credentials = f"{self.username}:{self.password}"
+        encoded_credentials = base64.b64encode(credentials.encode()).decode()
+        self.headers = {
+            'Authorization': f'Basic {encoded_credentials}'
+        }
+    
+    def fetch_domains_for_tld(self, tld: str) -> List[str]:
+        """
+        Fetch domains for a specific TLD
+        
+        Args:
+            tld: The top-level domain (e.g., 'sbs', 'icu')
+            
+        Returns:
+            List of domain names for that TLD
+        """
+        try:
+            url = f"{self.base_url}/{tld}/domains"
+            logger.info(f"Fetching domains for .{tld} from {url}...")
+            
+            response = requests.get(
+                url,
+                headers=self.headers,
+                timeout=30
+            )
+            response.raise_for_status()
+            
+            # Parse JSON response
+            data = response.json()
+            
+            # Extract domain names from response
+            domains = []
+            if isinstance(data, dict) and 'domains' in data:
+                domains = [item['domain'] for item in data['domains'] if 'domain' in item]
+            elif isinstance(data, list):
+                domains = [item['domain'] for item in data if 'domain' in item]
+            
+            logger.info(f"Successfully fetched {len(domains)} domains for .{tld}")
+            return domains
+            
+        except requests.RequestException as e:
+            logger.error(f"Error fetching domains for .{tld}: {e}")
+            return []
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.error(f"Error parsing API response for .{tld}: {e}")
+            return []
+    
+    def fetch_domains(self) -> List[str]:
+        """
+        Fetch domains from CentralNIC API for all configured TLDs
+        
+        Returns:
+            List of all domain names across all TLDs
+        """
+        all_domains = []
+        
+        logger.info(f"Fetching domains for TLDs: {', '.join(self.tlds)}")
+        
+        for tld in self.tlds:
+            tld = tld.strip()
+            domains = self.fetch_domains_for_tld(tld)
+            all_domains.extend(domains)
+        
+        logger.info(f"Successfully fetched {len(all_domains)} total domains across {len(self.tlds)} TLDs")
+        return all_domains
 
 
 class DomainChecker:
@@ -298,7 +385,13 @@ def main():
     )
     parser.add_argument(
         'input_file',
-        help='File with domains (one per line)'
+        nargs='?',
+        help='File with domains (one per line). If omitted, domains will be fetched from CentralNIC API'
+    )
+    parser.add_argument(
+        '--api',
+        action='store_true',
+        help='Fetch domains from CentralNIC API instead of file'
     )
     parser.add_argument(
         '-o', '--output',
@@ -332,8 +425,20 @@ def main():
     # Initialize Domain Checker
     checker = DomainChecker(timeout=args.timeout, max_workers=args.workers)
     
-    # Check domains
-    results = checker.check_domains_from_file(args.input_file)
+    # Get domains either from API or file
+    if args.api or not args.input_file:
+        # Fetch from API
+        try:
+            api = CentralNICAPI()
+            domains = api.fetch_domains()
+            results = checker.check_domains(domains)
+        except Exception as e:
+            logger.error(f"Failed to fetch domains from API: {e}")
+            print(f"Error: Could not fetch domains from API. {e}")
+            return 1
+    else:
+        # Load from file
+        results = checker.check_domains_from_file(args.input_file)
     
     # Save results
     checker.save_results(results, args.output)
