@@ -16,6 +16,8 @@ from datetime import datetime
 import os
 from dotenv import load_dotenv
 import base64
+import csv
+import threading
 
 # Load environment variables
 load_dotenv()
@@ -139,20 +141,85 @@ class DomainChecker:
         'page not found', 'seite nicht gefunden'
     ]
     
-    def __init__(self, timeout: int = 10, max_workers: int = 10):
+    def __init__(self, timeout: int = 10, max_workers: int = 10, csv_output: str = None):
         """
         Initializes the Domain Checker
         
         Args:
             timeout: Timeout for HTTP requests in seconds
             max_workers: Maximum number of parallel workers
+            csv_output: Optional CSV file path for live results
         """
         self.timeout = timeout
         self.max_workers = max_workers
+        self.csv_output = csv_output
+        self.csv_lock = threading.Lock() if csv_output else None
+        self.checked_domains = set()
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
+        
+        # Load existing domains from CSV if file exists
+        if self.csv_output:
+            self._load_existing_domains()
+    
+    def _load_existing_domains(self):
+        """Load already checked domains from existing CSV file"""
+        if not os.path.exists(self.csv_output):
+            logger.info(f"No existing CSV file found, will create new: {self.csv_output}")
+            self._initialize_csv()
+            return
+        
+        try:
+            with open(self.csv_output, 'r', newline='', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if 'domain' in row:
+                        self.checked_domains.add(row['domain'])
+            
+            logger.info(f"Loaded {len(self.checked_domains)} already checked domains from CSV")
+        except Exception as e:
+            logger.error(f"Failed to load existing domains from CSV: {e}")
+            self._initialize_csv()
+    
+    def _initialize_csv(self):
+        """Initialize CSV file with headers"""
+        try:
+            with open(self.csv_output, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'domain', 'status', 'is_advertising_suitable', 'http_status',
+                    'title', 'content_length', 'has_content', 'reason', 'checked_at'
+                ])
+            logger.info(f"Initialized CSV output: {self.csv_output}")
+        except Exception as e:
+            logger.error(f"Failed to initialize CSV file: {e}")
+    
+    def _append_to_csv(self, result: Dict):
+        """Append a result to the CSV file"""
+        if not self.csv_output:
+            return
+        
+        try:
+            with self.csv_lock:
+                with open(self.csv_output, 'a', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        result.get('domain', ''),
+                        result.get('status', ''),
+                        result.get('is_advertising_suitable', False),
+                        result.get('http_status', ''),
+                        result.get('title', ''),
+                        result.get('content_length', 0),
+                        result.get('has_content', False),
+                        result.get('reason', ''),
+                        result.get('checked_at', '')
+                    ])
+                    # Add to checked domains set
+                    self.checked_domains.add(result.get('domain', ''))
+        except Exception as e:
+            logger.error(f"Failed to write to CSV: {e}")
     
     def check_domain(self, domain: str) -> Dict:
         """
@@ -309,14 +376,25 @@ class DomainChecker:
             List of check results
         """
         results = []
-        total = len(domains)
         
+        # Filter out already checked domains
+        domains_to_check = [d for d in domains if d not in self.checked_domains]
+        skipped = len(domains) - len(domains_to_check)
+        
+        if skipped > 0:
+            logger.info(f"Skipping {skipped} already checked domains")
+        
+        total = len(domains_to_check)
         logger.info(f"Starting check of {total} domains...")
+        
+        if total == 0:
+            logger.info("All domains already checked!")
+            return results
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_domain = {
                 executor.submit(self.check_domain, domain): domain 
-                for domain in domains
+                for domain in domains_to_check
             }
             
             completed = 0
@@ -325,6 +403,10 @@ class DomainChecker:
                 try:
                     result = future.result()
                     results.append(result)
+                    
+                    # Write to CSV immediately if enabled
+                    if self.csv_output:
+                        self._append_to_csv(result)
                     
                     # Show progress
                     if completed % 10 == 0 or completed == total:
@@ -422,6 +504,10 @@ def main():
         action='store_true',
         help='Display a detailed report'
     )
+    parser.add_argument(
+        '--csv',
+        help='Enable live CSV output to specified file (e.g., results.csv)'
+    )
     
     args = parser.parse_args()
     
@@ -429,8 +515,12 @@ def main():
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     
-    # Initialize Domain Checker
-    checker = DomainChecker(timeout=args.timeout, max_workers=args.workers)
+    # Initialize Domain Checker with optional CSV output
+    checker = DomainChecker(
+        timeout=args.timeout, 
+        max_workers=args.workers,
+        csv_output=args.csv
+    )
     
     # Get domains either from API or file
     if args.api or not args.input_file:
@@ -447,8 +537,12 @@ def main():
         # Load from file
         results = checker.check_domains_from_file(args.input_file)
     
-    # Save results
+    # Save results to JSON
     checker.save_results(results, args.output)
+    
+    # Info about CSV if used
+    if args.csv:
+        print(f"✓ Live results written to: {args.csv}")
     
     # Display report
     if args.report:
